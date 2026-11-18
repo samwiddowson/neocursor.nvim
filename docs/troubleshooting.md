@@ -18,6 +18,7 @@ to paste into an issue.
 
 - [Cursor can't be found](#cursor-cant-be-found)
 - [The sidecar won't start](#the-sidecar-wont-start)
+- [The sidecar exits after it was working](#the-sidecar-exits-after-it-was-working)
 - [No suggestions appear](#no-suggestions-appear)
 - [`<Tab>` does nothing](#tab-does-nothing)
 - [Suggestions appear but in the wrong place](#suggestions-appear-but-in-the-wrong-place)
@@ -28,10 +29,10 @@ to paste into an issue.
 ## Cursor can't be found
 
 **Symptom:** the sidecar dies at startup, or `:NeocursorDebug` shows an error
-mentioning `state.vscdb` or a missing config directory.
+mentioning `state.vscdb`, `auth.json`, or a missing config directory.
 
 neocursor reads Cursor's signed-in session off disk. It looks where your
-platform puts it:
+platform puts the desktop app:
 
 | Platform | Cursor data dir |
 |---|---|
@@ -68,10 +69,57 @@ export CURSOR_STATE_DB_PATH="/path/to/User/globalStorage/state.vscdb"
 Set these where Neovim will inherit them — your shell profile, or
 `vim.env.CURSOR_CONFIG_DIR = "…"` in your config before `setup()`.
 
+### Cursor CLI instead of the desktop app
+
+If the desktop app is not installed, neocursor reads the Cursor CLI's
+`auth.json`. That file is only read. neocursor does not refresh it, does not
+write it, and does not read the macOS Keychain.
+
+| Platform | `auth.json` |
+|---|---|
+| Linux | `~/.config/cursor/auth.json` (`$XDG_CONFIG_HOME/cursor/auth.json` when that variable is set) |
+| macOS | `~/.cursor/auth.json` |
+| Windows | `%APPDATA%\Cursor\auth.json` |
+
+Linux and Windows write that file on a normal `agent login`. macOS does not:
+the default CLI login stays in the Keychain. To use the file there, set
+`AGENT_CLI_CREDENTIAL_STORE=file` and run `agent login` again.
+
+Sign in with `agent login` (or `cursor-agent login`). When the desktop
+database holds a token, that one wins, so the two can stay on different
+accounts. A desktop database that is present but unsigned-in or unreadable
+fails as a desktop session. The CLI file has no machine id. The first CLI-only
+run writes a stable pair to `$XDG_STATE_HOME/neocursor/machine.json` (default
+`~/.local/state/neocursor/machine.json`) and reuses it. A desktop
+`storage.json` that already has a machine id still wins. One without a machine
+id does not block CLI login. A desktop session still needs its own
+`storage.json`.
+
+`uv run cursor_paths.py` names the session the sidecar will use (`desktop`,
+`cli`, or `none`). A desktop database that is present but unsigned-in or
+unreadable is `desktop`, and the CLI file is not used. A `cli` session that
+has to create machine ids also prints `machine.json`. The script never prints
+the token.
+
+neocursor never refreshes this token and never calls Cursor's refresh
+endpoint. `agent` refreshes `auth.json` on its own schedule. A session keeps
+the token it started with until the backend rejects a request; that rejection
+re-reads the file once and retries, so a file the CLI has already refreshed
+keeps working. When the re-read token is already expired, or the retry is
+rejected too, the sidecar exits and does not restart itself. Run `agent
+login` if the file is stale, then restart Neovim. The same expired-token
+message appears at startup when `auth.json` is already past its expiry. See
+[the sidecar exits after it was working](#the-sidecar-exits-after-it-was-working).
+
+```sh
+export CURSOR_CLI_AUTH_PATH="/path/to/auth.json"   # unusual location
+```
+
 ### Signed in?
 
-neocursor uses an existing session; it cannot create one. Open Cursor, confirm
-you're logged in, and let it sync once before trying again.
+neocursor uses an existing session; it cannot create one. Open Cursor and
+confirm you're logged in, or run `agent login`, before trying again. On macOS,
+`agent login` fills the Keychain unless `AGENT_CLI_CREDENTIAL_STORE=file`.
 
 ---
 
@@ -94,6 +142,31 @@ Common causes:
   ```
 - **A custom `sidecar_cmd` that doesn't work.** Clear the override and retry
   with the default before debugging anything else.
+
+---
+
+## The sidecar exits after it was working
+
+**Symptom:** suggestions stop, and Neovim reports `neocursor: sidecar exited`
+followed by one of these lines. Both name the file, never the token.
+
+- `Cursor CLI access token in …/auth.json is already expired. Run agent login.`
+  The token's expiry is in the past and the CLI has not written a new one.
+  Run `agent login` (or leave `agent` running long enough for it to refresh
+  the file), then restart Neovim. The sidecar does not come back on its own.
+- `Cursor CLI session in …/auth.json was rejected. Run agent login.`
+  The backend rejected the token, and re-reading the file found nothing
+  usable — or the same token, and the retry was rejected too. Run
+  `agent login`, then restart Neovim.
+
+  One case needs no new login. The re-read happens once, immediately. If
+  `agent` was rewriting `auth.json` at that instant, the read can land on an
+  empty or half-written file, and that counts as no token even though the
+  file is fine a moment later. Run `uv run cursor_paths.py`. When it now says
+  `accessToken present`, the read landed mid-write: restart Neovim.
+
+A desktop session is not failed this way. A rejected request there leaves the
+sidecar running and that request empty.
 
 ---
 

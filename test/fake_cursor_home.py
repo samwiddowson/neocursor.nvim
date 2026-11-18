@@ -14,6 +14,7 @@ into Cursor. The token is deliberately invalid: the backend rejects it, which is
 fine, because CppConfig failures are swallowed by design.
 """
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -38,6 +39,17 @@ def build(root: Path) -> Path:
         encoding="utf-8",
     )
     return db
+
+
+def build_cli_auth(path: Path, access_token: str, refresh_token: str = "refresh-not-for-requests") -> Path:
+    """Write a Cursor CLI auth.json. The refresh token must never be sent."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"accessToken": access_token, "refreshToken": refresh_token}),
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o600)
+    return path
 
 
 if __name__ == "__main__":

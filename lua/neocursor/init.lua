@@ -599,15 +599,20 @@ function M.start()
   local job = vim.fn.jobstart(cmd, {
     on_stdout = on_stdout,
     on_stderr = on_stderr,
-    on_exit = function()
+    on_exit = function(id, code)
+      -- M.stop() already cleared state.job; a stale exit must not clobber a
+      -- sidecar started since.
+      if state.job ~= id then return end
       local never_ready = not state.ready
       state.job = nil; state.ready = false; state.awaiting = false
-      log("SIDECAR exited")
-      -- Died during startup: say why instead of going quietly inert.
-      if never_ready then
+      log("SIDECAR exited (" .. tostring(code) .. ")")
+      -- Died during startup, or later with an error (a CLI session the backend
+      -- rejected): say why instead of going quietly inert.
+      if never_ready or code ~= 0 then
         local why = table.concat(state.stderr_tail, "\n")
         vim.notify(
-          "neocursor: sidecar exited during startup" .. (why ~= "" and ("\n" .. why) or ""),
+          "neocursor: sidecar exited" .. (never_ready and " during startup" or "")
+            .. (why ~= "" and ("\n" .. why) or ""),
           vim.log.levels.ERROR
         )
       end

@@ -48,13 +48,23 @@ at the *same* latency, as Cursor itself.
 ## Requirements
 
 - **Neovim ≥ 0.10**
-- **Cursor, installed and signed in** (the desktop app) — neocursor reads your
-  existing session. No token to paste, no API key, no separate subscription.
+- **Cursor, installed and signed in.** The desktop app works on every platform.
+  The Cursor CLI (`agent` / `cursor-agent`, signed in with `agent login`) is
+  enough on its own where it writes `auth.json`: Linux and Windows do that by
+  default, and macOS does it when `AGENT_CLI_CREDENTIAL_STORE=file`. A default
+  macOS CLI login stays in the Keychain, which neocursor does not read.
+  neocursor does not refresh a CLI login. That session keeps working only
+  while `agent` itself keeps `auth.json` current; once the token is rejected
+  and the file is still stale, the sidecar exits and Neovim has to be
+  restarted.
+  See [the sidecar exits after it was working](./docs/troubleshooting.md#the-sidecar-exits-after-it-was-working).
+  No token to paste, no API key, no separate subscription.
 - **[`uv`](https://github.com/astral-sh/uv)** on your `PATH` — the Python sidecar
   runs through it and fetches its own deps. Nothing to `pip install`.
 
 Works on **macOS, Linux and Windows**; the sidecar finds Cursor's session
-wherever your platform puts it. Portable install, Flatpak/Snap, or WSL? See
+wherever your platform puts it. Portable install, Flatpak/Snap, WSL, or only
+the CLI? See
 [Cursor can't be found](./docs/troubleshooting.md#cursor-cant-be-found).
 
 ---

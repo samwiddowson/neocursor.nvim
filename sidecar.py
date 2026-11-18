@@ -17,7 +17,7 @@ line/col in the request are 0-indexed (neovim). range in the reply is
 
 Launch:  uv run --with 'httpx[http2]' sidecar.py
 """
-import io, os, sys, json, base64, time, sqlite3, struct, socket, subprocess, threading
+import io, os, sys, json, base64, time, struct, socket, subprocess, threading
 import httpx
 import cursor_paths
 
@@ -73,19 +73,72 @@ if sys.platform == "darwin":  # the bug is mDNSResponder's; elsewhere getaddrinf
 URL = "https://api2.cursor.sh/aiserver.v1.AiService/StreamCpp"
 
 
-def read_token() -> str:
-    if not cursor_paths.state_db().is_file():
-        raise RuntimeError(cursor_paths.not_found_message())
-    con = sqlite3.connect(cursor_paths.state_db_uri(), uri=True)
-    row = con.execute(
-        "SELECT value FROM ItemTable WHERE key='cursorAuth/accessToken'"
-    ).fetchone()
-    con.close()
-    if not row:
-        raise RuntimeError(
-            f"no cursorAuth/accessToken in {cursor_paths.state_db()} — is Cursor signed in?"
-        )
-    return row[0]
+# "desktop" keeps today's failure mode. "cli" may re-read auth.json after HTTP 401.
+_AUTH_FROM = "desktop"
+
+
+def _desktop_token() -> str | None:
+    """cursorAuth/accessToken from the desktop database.
+
+    None means the database file is absent, so the CLI file may be tried.
+    A database that is present but unsigned-in or unreadable stays a desktop
+    failure: the CLI session can belong to a different account.
+    """
+    return cursor_paths.read_desktop_access_token()
+
+
+def _jwt_exp(token: str):
+    """Numeric `exp` claim, or None when the token isn't a JWT we can read."""
+    parts = token.split(".")
+    if len(parts) < 2 or not parts[1]:
+        return None
+    seg = parts[1]
+    pad = "=" * ((4 - len(seg) % 4) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(seg + pad))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    exp = payload.get("exp")
+    if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+        return None
+    return float(exp)
+
+
+def _token_expired(token: str) -> bool:
+    exp = _jwt_exp(token)
+    if exp is None:
+        return False
+    return exp <= time.time()
+
+
+def _cli_token_for_session(path) -> str | None:
+    """CLI accessToken, or None when the file has none.
+
+    A token that has not expired yet is kept, however close `exp` is. A token
+    that is already expired raises. Nothing here re-reads the file: the two
+    reads would be microseconds apart, and the CLI only refreshes on its own
+    schedule. A later HTTP 401 re-reads once. This does not write the file
+    and does not call Cursor's refresh endpoint.
+    """
+    tok = cursor_paths.read_cli_access_token(path)
+    if not tok:
+        return None
+    if _token_expired(tok):
+        raise RuntimeError(cursor_paths.cli_expired_message(path))
+    return tok
+
+
+def read_token() -> tuple:
+    """(token, source). Desktop SQLite wins; otherwise the CLI auth file."""
+    desktop = _desktop_token()
+    if desktop:
+        return desktop, "desktop"
+    tok = _cli_token_for_session(cursor_paths.cli_auth_path())
+    if tok:
+        return tok, "cli"
+    raise RuntimeError(cursor_paths.not_found_message())
 
 
 def alf(b: bytes) -> bytes:
@@ -105,21 +158,53 @@ def frame(b: bytes) -> bytes:
     return b"\x00" + struct.pack(">I", len(b)) + b
 
 
-def read_session():
-    """Token + machine ids from the local Cursor install."""
-    tok = read_token()
+def read_machine_ids(source: str) -> tuple:
+    """Desktop storage.json when this session is desktop, or when it has an id.
+
+    The CLI auth file has no telemetry ids. StreamCpp still wants the two
+    values that go into x-cursor-checksum, so a CLI-only machine gets a
+    stable pair of its own. A leftover storage.json that never received a
+    machine id is not a desktop session and must not block that login.
+    Desktop sessions keep the requirement that Cursor has written the id.
+    Request headers stay the IDE client either way.
+    """
     sj_path = cursor_paths.storage_json()
+    if not sj_path.is_file():
+        if source != "cli":
+            try:
+                with open(sj_path, encoding="utf-8"):
+                    pass
+            except OSError as e:
+                raise RuntimeError(f"cannot read {sj_path}: {e}")
+            raise RuntimeError(f"cannot read {sj_path}")
+        return cursor_paths.load_or_create_machine_ids()
     try:
         with open(sj_path, encoding="utf-8") as fh:
             sj = json.load(fh)
-    except OSError as e:
+    except (OSError, UnicodeError, json.JSONDecodeError) as e:
+        if source == "cli":
+            return cursor_paths.load_or_create_machine_ids()
+        if isinstance(e, json.JSONDecodeError):
+            raise RuntimeError(f"cannot read {sj_path}: invalid JSON")
         raise RuntimeError(f"cannot read {sj_path}: {e}")
-    mid = sj.get("telemetry.machineId")
+    mid = sj.get("telemetry.machineId") if isinstance(sj, dict) else None
     if not mid:
+        if source == "cli":
+            return cursor_paths.load_or_create_machine_ids()
         raise RuntimeError(f"no telemetry.machineId in {sj_path} — launch Cursor once")
     # macMachineId is MAC-address-derived, not macOS-specific: VS Code (and so
     # Cursor) writes it everywhere. Fall back to machineId if it's missing.
-    return tok, mid, sj.get("telemetry.macMachineId") or mid
+    mac = sj.get("telemetry.macMachineId") if isinstance(sj, dict) else None
+    return mid, mac or mid
+
+
+def read_session():
+    """Token + machine ids. Desktop session preferred, else the CLI auth file."""
+    global _AUTH_FROM
+    tok, source = read_token()
+    _AUTH_FROM = source
+    mid, mac = read_machine_ids(source)
+    return tok, mid, mac
 
 
 try:
@@ -140,15 +225,64 @@ HEADERS = {
 STREAM_URL = URL
 
 
-def fetch_config() -> dict:
-    url = URL.rsplit("/", 1)[0] + "/CppConfig"
+def _request_headers(content_type: str | None = None) -> dict:
     h = dict(HEADERS)
     h["authorization"] = f"Bearer {TOK}"
     h["x-cursor-checksum"] = checksum(MID, MAC)
-    h["content-type"] = "application/json"  # CppConfig is unary, not connect+json
+    if content_type:
+        h["content-type"] = content_type
+    return h
+
+
+def _bail_cli(message: str):
+    """The CLI session is still unusable. The message names the file, not the token."""
+    sys.stderr.write(f"neocursor sidecar: {message}\n")
+    sys.stderr.flush()
+    raise SystemExit(1)
+
+
+def _on_unauthorized() -> bool:
+    """Re-read the CLI auth file after this request got HTTP 401.
+
+    Returns True when the caller should retry the request once. Each rejected
+    request gets its own re-read; a later request may find that the CLI has
+    rotated the file. A re-read that is missing or already expired exits.
+    Desktop sessions are not reloaded and are not failed here. Never writes
+    auth.json and never calls the refresh endpoint.
+    """
+    global TOK
+    if _AUTH_FROM != "cli":
+        return False
+    tok = cursor_paths.read_cli_access_token(cursor_paths.cli_auth_path())
+    if not tok:
+        _bail_cli(cursor_paths.cli_rejected_message())
+    if _token_expired(tok):
+        _bail_cli(cursor_paths.cli_expired_message())
+    TOK = tok
+    return True
+
+
+def fetch_config() -> dict:
+    url = URL.rsplit("/", 1)[0] + "/CppConfig"
+
+    def post():
+        # CppConfig is unary, not connect+json.
+        return CLIENT.post(
+            url,
+            content=json.dumps({"model": "", "supportsCpt": True}).encode(),
+            headers=_request_headers("application/json"),
+            timeout=10,
+        )
+
     try:
-        r = CLIENT.post(url, content=json.dumps({"model": "", "supportsCpt": True}).encode(), headers=h, timeout=10)
+        r = post()
+        if r.status_code == 401 and _on_unauthorized():
+            r = post()
+        if r.status_code == 401 and _AUTH_FROM == "cli":
+            _bail_cli(cursor_paths.cli_rejected_message())
         return r.json() if r.status_code == 200 else {}
+    except SystemExit:
+        raise
     except Exception:
         return {}
 
@@ -225,93 +359,97 @@ def complete(req: dict, cancelled=lambda: False):
     lint = req.get("linter_errors")
     if lint and lint.get("errors"):
         body["linterErrors"] = _linter(lint)
-    h = dict(HEADERS)
-    h["authorization"] = f"Bearer {TOK}"
-    h["x-cursor-checksum"] = checksum(MID, MAC)
 
     # The multidiff model streams a SEQUENCE of edits in one response, each
     # bracketed by beginEdit/doneEdit, plus a cursorPredictionTarget pointing at
     # the chain's first jump. Split them into an ordered list so the client can
     # walk the chain locally (one Tab per edit) with no extra round-trips.
-    edits, cur, prediction = [], None, None
+    # A CLI-session 401 re-reads auth.json and retries this request once.
+    for attempt in (1, 2):
+        h = _request_headers()
+        edits, cur, prediction = [], None, None
 
-    def flush():
-        nonlocal cur
-        if cur is not None and (cur["text"] or cur["range"] is not None):
-            t = cur["text"]
-            if cur["eol"]:  # shouldRemoveLeadingEol: drop the leading newline
-                if t.startswith("\r\n"):
-                    t = t[2:]
-                elif t.startswith("\n"):
-                    t = t[1:]
-            edits.append({"text": t, "range": cur["range"]})
-        cur = None
+        def flush():
+            nonlocal cur
+            if cur is not None and (cur["text"] or cur["range"] is not None):
+                t = cur["text"]
+                if cur["eol"]:  # shouldRemoveLeadingEol: drop the leading newline
+                    if t.startswith("\r\n"):
+                        t = t[2:]
+                    elif t.startswith("\n"):
+                        t = t[1:]
+                edits.append({"text": t, "range": cur["range"]})
+            cur = None
 
-    def feed(flag, msg):
-        nonlocal cur, prediction
-        if flag & 0x02:
-            return
-        try:
-            j = json.loads(msg)
-        except Exception:
-            return
-        if j.get("beginEdit"):
-            flush()
-            cur = {"text": "", "range": None, "eol": False}
-            return
-        if "text" in j:
-            if cur is None:
+        def feed(flag, msg):
+            nonlocal cur, prediction
+            if flag & 0x02:
+                return
+            try:
+                j = json.loads(msg)
+            except Exception:
+                return
+            if j.get("beginEdit"):
+                flush()
                 cur = {"text": "", "range": None, "eol": False}
-            cur["text"] += j.get("text", "")
-            return
-        rr = j.get("rangeToReplace")
-        if rr:
-            if cur is None:
-                cur = {"text": "", "range": None, "eol": False}
-            cur["range"] = {
-                "start": rr.get("startLineNumber"),
-                "endInclusive": rr.get("endLineNumberInclusive"),
-            }
-            if j.get("shouldRemoveLeadingEol"):
-                cur["eol"] = True
-            return
-        cpt = j.get("cursorPredictionTarget")
-        if cpt and prediction is None:
-            prediction = {
-                "path": cpt.get("relativePath"),
-                "line": cpt.get("lineNumberOneIndexed"),
-            }
-        if j.get("doneEdit"):
-            flush()
+                return
+            if "text" in j:
+                if cur is None:
+                    cur = {"text": "", "range": None, "eol": False}
+                cur["text"] += j.get("text", "")
+                return
+            rr = j.get("rangeToReplace")
+            if rr:
+                if cur is None:
+                    cur = {"text": "", "range": None, "eol": False}
+                cur["range"] = {
+                    "start": rr.get("startLineNumber"),
+                    "endInclusive": rr.get("endLineNumberInclusive"),
+                }
+                if j.get("shouldRemoveLeadingEol"):
+                    cur["eol"] = True
+                return
+            cpt = j.get("cursorPredictionTarget")
+            if cpt and prediction is None:
+                prediction = {
+                    "path": cpt.get("relativePath"),
+                    "line": cpt.get("lineNumberOneIndexed"),
+                }
+            if j.get("doneEdit"):
+                flush()
 
-    # Stream the reply and bail between chunks once superseded: exiting the
-    # `with` closes the HTTP/2 stream, i.e. Cursor's cancelCpp-on-abort. The
-    # connect frames (1B flag + 4B len) can split across chunks, so buffer.
-    buf = b""
-    with CLIENT.stream(
-        "POST", STREAM_URL, content=frame(json.dumps(body).encode()), headers=h
-    ) as r:
-        for chunk in r.iter_bytes():
-            if cancelled():
-                return None
-            buf += chunk
-            while len(buf) >= 5:
-                ln = struct.unpack(">I", buf[1:5])[0]
-                if len(buf) < 5 + ln:
-                    break
-                feed(buf[0], buf[5 : 5 + ln])
-                buf = buf[5 + ln :]
-    if cancelled():
-        return None
-    flush()  # in case the stream ends mid-edit
+        # Stream the reply and bail between chunks once superseded: exiting the
+        # `with` closes the HTTP/2 stream, i.e. Cursor's cancelCpp-on-abort. The
+        # connect frames (1B flag + 4B len) can split across chunks, so buffer.
+        buf = b""
+        with CLIENT.stream(
+            "POST", STREAM_URL, content=frame(json.dumps(body).encode()), headers=h
+        ) as r:
+            if r.status_code == 401 and attempt == 1 and _on_unauthorized():
+                continue
+            if r.status_code == 401 and _AUTH_FROM == "cli":
+                _bail_cli(cursor_paths.cli_rejected_message())
+            for chunk in r.iter_bytes():
+                if cancelled():
+                    return None
+                buf += chunk
+                while len(buf) >= 5:
+                    ln = struct.unpack(">I", buf[1:5])[0]
+                    if len(buf) < 5 + ln:
+                        break
+                    feed(buf[0], buf[5 : 5 + ln])
+                    buf = buf[5 + ln :]
+        if cancelled():
+            return None
+        flush()  # in case the stream ends mid-edit
 
-    first = edits[0] if edits else {"text": "", "range": None}
-    return {
-        "text": first["text"],
-        "range": first["range"],
-        "edits": edits,
-        "prediction": prediction,
-    }
+        first = edits[0] if edits else {"text": "", "range": None}
+        return {
+            "text": first["text"],
+            "range": first["range"],
+            "edits": edits,
+            "prediction": prediction,
+        }
 
 
 def main():
@@ -354,6 +492,10 @@ def main():
 
         try:
             res = complete(req, cancelled)
+        except SystemExit:
+            # _bail_cli in a worker thread would only kill the worker. The
+            # editor should see the sidecar exit, not hang on a silent request.
+            os._exit(1)
         except Exception as e:
             # a stream torn down mid-abort raises; that's a cancel, not an error
             if cancelled():
